@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#04080b">
+<title>Phone Radar Live</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@300;500&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: lock screen. Big clock on top, square radar in the middle, device count under it, unlock handle at the bottom. */
+:root {
+  --bg: #04080b;
+  --ink: #e9f1ee;
+  --amber: #ffb347;
+  --amber-dim: #7a5424;
+  --grid: #16262b;
+  --muted: #6d8087;
+  --display: "Rajdhani", "Arial Narrow", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+  color-scheme: dark;
+}
+html, body { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--mono);
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 18px;
+  box-sizing: border-box;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.screen { height: 100%; display: flex; flex-direction: column; align-items: center; gap: 10px; max-width: 520px; margin: 0 auto; }
+.top { text-align: center; }
+.date { font-size: 15px; letter-spacing: .06em; color: var(--muted); }
+.clock { font-family: var(--display); font-weight: 300; font-size: clamp(72px, 17vh, 120px); line-height: .95; letter-spacing: .01em; font-variant-numeric: tabular-nums; }
+.radar-wrap { flex: 1 1 0; min-height: 0; width: 100%; display: flex; align-items: center; justify-content: center; }
+canvas { display: block; width: min(100%, 100%); aspect-ratio: 1; max-height: 100%; max-width: 100%; }
+.count { text-align: center; display: grid; gap: 2px; }
+.count .label { font-size: 12px; letter-spacing: .28em; color: var(--muted); }
+.count .num { font-family: var(--display); font-weight: 500; font-size: 64px; line-height: 1; color: var(--amber); font-variant-numeric: tabular-nums; text-shadow: 0 0 22px rgba(255,179,71,.35); }
+.count .sub { font-size: 12px; color: var(--muted); }
+.demo { font-size: 10px; letter-spacing: .2em; color: var(--amber-dim); border: 1px solid var(--amber-dim); padding: 2px 8px; border-radius: 99px; }
+.demo.live { color: var(--amber); border-color: var(--amber); }
+.actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: center; }
+#scan { font: 500 12px var(--mono); letter-spacing: .16em; color: var(--bg); background: var(--amber); border: 0; border-radius: 99px; padding: 10px 18px; cursor: pointer; }
+#scan:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+#msg { font-size: 11px; color: var(--muted); text-align: center; min-height: 2.6em; max-width: 34ch; }
+.bottom { width: 100%; display: flex; align-items: center; justify-content: space-between; padding-top: 6px; }
+.btn { width: 46px; height: 46px; border-radius: 50%; background: #0d171b; border: 1px solid var(--grid); display: grid; place-items: center; color: var(--ink); }
+.btn svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.handle { width: 38%; height: 5px; border-radius: 3px; background: var(--ink); opacity: .55; }
+@media (max-height: 700px) { .count .num { font-size: 48px; } .clock { font-size: 64px; } #msg { display: none; } }
+@media (prefers-reduced-motion: reduce) { .clock { transition: none; } }
+</style>
+</head>
+<body>
+<div class="screen">
+  <div class="top">
+    <div class="date" id="date"></div>
+    <div class="clock" id="clock">00:00</div>
+  </div>
+  <div class="radar-wrap"><canvas id="radar" aria-label="Radar-style view of simulated or nearby Bluetooth LE devices"></canvas></div>
+  <div class="count">
+    <div class="label" id="label">SIMULATED DEVICES</div>
+    <div class="num" id="num">0</div>
+    <div class="sub" id="sub">demo data · not a real scan</div>
+  </div>
+  <div class="actions"><button id="scan" type="button">START LIVE SCAN</button><div class="demo" id="mode">SIMULATION</div></div>
+  <div id="msg">Simulation only. Live scan detects nearby Bluetooth LE broadcasts; direction is visual.</div>
+  <div class="bottom">
+    <div class="btn" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M9 3h6l-1 6h-4z"/><path d="M8 9h8v3l-2 2v7h-4v-7l-2-2z"/></svg></div>
+    <div class="handle"></div>
+    <div class="btn" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  var TAU = Math.PI * 2, MAXM = 30, PERIOD = 4.2, t0 = performance.now(), shown = -1;
+  var cv = document.getElementById('radar'), ctx = cv.getContext('2d');
+  var types = ['iPhone', 'iPhone', 'iPhone', 'Galaxy', 'Galaxy', 'Pixel', 'Xiaomi', 'Unknown'];
+  var devices = [], target = 5, nextTarget = 0, size = 300, dpr = 1, ping = null;
+  var mode = 'sim', live = new Map(), scanObj = null, STALE = 25;
+  var MFR = { 0x004C: 'Apple', 0x0075: 'Samsung', 0x00E0: 'Google', 0x0006: 'Microsoft', 0x0087: 'Garmin', 0x009E: 'Bose', 0x0157: 'Huami' };
+  var PHONEISH = { Apple: 1, Samsung: 1, Google: 1 };
+  function hashAngle(id) { var h = 2166136261; for (var i = 0; i < id.length; i++) { h ^= id.charCodeAt(i); h = Math.imul(h, 16777619); } return ((h >>> 0) % 36000) / 36000 * TAU; }
+  function rssiToM(rssi, tx) { return Math.max(1, Math.min(MAXM, Math.pow(10, ((tx == null ? -59 : tx) - rssi) / 22))); }
+  function nowS() { return (performance.now() - t0) / 1000; }
+  function onAdv(ev) {
+    var id = ev.device && (ev.device.id || ev.device.name) || 'x', t = nowS(), v = live.get(id);
+    var kind = null;
+    if (ev.manufacturerData) ev.manufacturerData.forEach(function (_, k) { if (!kind && MFR[k]) kind = MFR[k]; });
+    var name = ev.name || (ev.device && ev.device.name) || '';
+    if (/iphone/i.test(name)) kind = 'iPhone'; else if (/galaxy|sm-/i.test(name)) kind = 'Galaxy'; else if (/pixel/i.test(name)) kind = 'Pixel';
+    if (!v) { v = { id: id, a: hashAngle(id), rssi: ev.rssi, born: t, seen: false, type: kind || name || 'BLE', phone: false }; live.set(id, v); }
+    v.rssi = v.rssi + (ev.rssi - v.rssi) * 0.25;
+    v.tx = ev.txPower; v.last = t;
+    if (kind) v.type = kind;
+    v.phone = !!(PHONEISH[v.type] || /^(iPhone|Galaxy|Pixel)$/.test(v.type));
+    v.d = rssiToM(v.rssi, v.tx) / MAXM;
+  }
+  function liveList(t) {
+    live.forEach(function (v, k) { if (t - v.last > STALE) live.delete(k); else v.life = v.last + STALE - v.born; });
+    return Array.from(live.values());
+  }
+  function setMsg(m) { document.getElementById('msg').textContent = m; }
+  function setMode(m) {
+    mode = m;
+    var pill = document.getElementById('mode'), btn = document.getElementById('scan');
+    pill.textContent = m === 'live' ? 'LIVE \u00b7 BLE' : 'SIMULATION'; pill.className = 'demo' + (m === 'live' ? ' live' : '');
+    btn.textContent = m === 'live' ? 'STOP SCAN' : 'START LIVE SCAN';
+    document.getElementById('label').textContent = m === 'live' ? 'BLE DEVICES NEARBY' : 'SIMULATED DEVICES';
+    shown = -1;
+  }
+  async function toggleScan() {
+    if (mode === 'live') {
+      try { if (scanObj && scanObj.active) scanObj.stop(); } catch (e) {}
+      if (navigator.bluetooth) navigator.bluetooth.removeEventListener('advertisementreceived', onAdv);
+      live.clear(); setMode('sim'); setMsg('Scan stopped. Showing demo data.'); return;
+    }
+    if (!navigator.bluetooth) { setMsg('Live scan needs Chrome on Android, HTTPS, and Web Bluetooth support.'); return; }
+    if (!navigator.bluetooth.requestLEScan) { setMsg('Live scan is experimental. In Chrome on Android, enable chrome://flags/#enable-experimental-web-platform-features, restart Chrome, then try again.'); return; }
+    try {
+      navigator.bluetooth.addEventListener('advertisementreceived', onAdv);
+      scanObj = await navigator.bluetooth.requestLEScan({ acceptAllAdvertisements: true, keepRepeatedDevices: true });
+      live.clear(); setMode('live');
+      setMsg('Scanning BLE broadcasts. Direction is visual only; distance and device type are rough estimates.');
+    } catch (e) {
+      navigator.bluetooth.removeEventListener('advertisementreceived', onAdv);
+      setMsg('Scan could not start: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function resize() {
+    var r = cv.getBoundingClientRect();
+    size = Math.max(160, Math.floor(Math.min(r.width, r.height)));
+    dpr = Math.min(window.devicePixelRatio || 1, 3);
+    cv.width = cv.height = Math.floor(size * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  function spawn(t) {
+    devices.push({
+      a: Math.random() * TAU, d: 0.12 + Math.sqrt(Math.random()) * 0.84,
+      type: types[(Math.random() * types.length) | 0],
+      va: (Math.random() - 0.5) * 0.02, vd: (Math.random() - 0.5) * 0.012,
+      born: t, life: 18 + Math.random() * 40, seen: false
+    });
+  }
+  function step(t, dt) {
+    if (t > nextTarget) { target = Math.max(2, Math.min(10, target + ((Math.random() * 3) | 0) - 1)); nextTarget = t + 3 + Math.random() * 5; }
+    if (devices.length < target && Math.random() < 0.03) spawn(t);
+    devices.forEach(function (v) {
+      v.a = (v.a + v.va * dt * 6 + TAU) % TAU;
+      v.d = Math.max(0.08, Math.min(0.97, v.d + v.vd * dt));
+      if (v.d <= 0.08 || v.d >= 0.97) v.vd *= -1;
+    });
+    devices = devices.filter(function (v) { return t - v.born < v.life && !(devices.length > target + 1 && Math.random() < 0.01); });
+  }
+  function draw(t) {
+    var c = size / 2, R = c - 8, beam = (t / PERIOD * TAU) % TAU;
+    ctx.clearRect(0, 0, size, size);
+    ctx.lineWidth = 1; ctx.strokeStyle = '#16262b'; ctx.fillStyle = '#6d8087';
+    ctx.font = '10px "IBM Plex Mono", monospace'; ctx.textAlign = 'left';
+    for (var i = 1; i <= 4; i++) {
+      ctx.beginPath(); ctx.arc(c, c, R * i / 4, 0, TAU); ctx.stroke();
+      ctx.fillText((MAXM * i / 4) + 'm', c + 4, c - R * i / 4 + 11);
+    }
+    ctx.beginPath(); ctx.moveTo(c - R, c); ctx.lineTo(c + R, c); ctx.moveTo(c, c - R); ctx.lineTo(c, c + R); ctx.stroke();
+    for (var k = 0; k < 72; k++) {
+      var an = k / 72 * TAU, l = k % 6 === 0 ? 8 : 4;
+      ctx.beginPath(); ctx.moveTo(c + Math.cos(an) * R, c + Math.sin(an) * R);
+      ctx.lineTo(c + Math.cos(an) * (R - l), c + Math.sin(an) * (R - l)); ctx.stroke();
+    }
+    // sweep: fading wedge behind the beam
+    var S = 44, span = 1.15;
+    for (var s = 0; s < S; s++) {
+      var a1 = beam - span * (s + 1) / S, a0 = beam - span * s / S;
+      ctx.fillStyle = 'rgba(255,179,71,' + (0.30 * Math.pow(1 - s / S, 2.2)).toFixed(3) + ')';
+      ctx.beginPath(); ctx.moveTo(c, c); ctx.arc(c, c, R, a1, a0 + 0.005); ctx.closePath(); ctx.fill();
+    }
+    ctx.strokeStyle = 'rgba(255,200,120,.9)'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(c, c); ctx.lineTo(c + Math.cos(beam) * R, c + Math.sin(beam) * R); ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,179,71,.5)'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(c, c, R, 0, TAU); ctx.stroke();
+    // phones
+    var list = mode === 'live' ? liveList(t) : devices;
+    list.forEach(function (v) {
+      var delta = (beam - v.a + TAU) % TAU, glow = Math.exp(-delta / 1.6);
+      var life = Math.min(1, (t - v.born) / 0.6, ((v.life || 99) - (t - v.born)) / 1.5);
+      var x = c + Math.cos(v.a) * v.d * R, y = c + Math.sin(v.a) * v.d * R, al = (0.2 + 0.8 * glow) * Math.max(0, life);
+      if (delta < 0.12) v.seen = true;
+      if (!v.seen) return;
+      ctx.fillStyle = 'rgba(255,179,71,' + (al * 0.25).toFixed(3) + ')';
+      ctx.beginPath(); ctx.arc(x, y, 9 + 6 * glow, 0, TAU); ctx.fill();
+      ctx.fillStyle = delta < 0.2 ? 'rgba(255,245,225,' + al + ')' : 'rgba(255,179,71,' + al + ')';
+      ctx.beginPath(); ctx.arc(x, y, 3.4, 0, TAU); ctx.fill();
+      if (glow > 0.45 && life > 0.5) {
+        ctx.fillStyle = 'rgba(233,241,238,' + Math.min(0.9, al).toFixed(2) + ')';
+        ctx.font = '10px "IBM Plex Mono", monospace';
+        var left = x > c + R * 0.45;
+        ctx.textAlign = left ? 'right' : 'left';
+        ctx.fillText(v.type + ' · ' + Math.round(v.d * MAXM) + 'm', x + (left ? -10 : 10), y + 3);
+      }
+    });
+    if (ping) {
+      var p = (t - ping) / 1.4;
+      if (p > 1) ping = null; else {
+        ctx.strokeStyle = 'rgba(255,179,71,' + (0.7 * (1 - p)).toFixed(2) + ')'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(c, c, R * p, 0, TAU); ctx.stroke();
+      }
+    }
+    ctx.fillStyle = '#e9f1ee'; ctx.beginPath(); ctx.arc(c, c, 3, 0, TAU); ctx.fill();
+  }
+
+  var numEl = document.getElementById('num');
+  function tickClock() {
+    var d = new Date();
+    document.getElementById('clock').textContent = d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+    document.getElementById('date').textContent = d.toLocaleDateString('he-IL', { weekday: 'long', day: 'numeric', month: 'long' });
+  }
+  var last = 0;
+  function frame(now) {
+    var t = (now - t0) / 1000, dt = Math.min(0.1, t - last); last = t;
+    if (mode === 'sim') step(t, dt);
+    draw(t);
+    var n, ph = 0;
+    if (mode === 'live') { var L = Array.from(live.values()); n = L.length; ph = L.filter(function (v) { return v.phone; }).length; }
+    else n = devices.filter(function (v) { return v.seen; }).length;
+    var key = n * 100 + ph;
+    if (key !== shown) { shown = key; numEl.textContent = n; document.getElementById('sub').textContent = mode === 'live' ? (ph + ' may be phones \u00b7 rough distance') : 'demo data · not a real scan'; }
+    requestAnimationFrame(frame);
+  }
+  window.addEventListener('resize', resize);
+  document.getElementById('scan').addEventListener('click', toggleScan);
+  document.addEventListener('pointerdown', function () { ping = (performance.now() - t0) / 1000; });
+  try { if (navigator.wakeLock) navigator.wakeLock.request('screen').catch(function () {}); } catch (e) {}
+  for (var i = 0; i < 5; i++) spawn(-5);
+  tickClock(); setInterval(tickClock, 1000);
+  resize();
+  if (window.ResizeObserver) new ResizeObserver(resize).observe(cv.parentElement);
+  requestAnimationFrame(frame);
+})();
+</script>
+
+</body>
+</html>
